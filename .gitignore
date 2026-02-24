@@ -1,0 +1,82 @@
+# Build directories
+build/
+build_codex/
+cmake-build-*/
+out/
+
+# Compiled Object files
+*.slo
+*.lo
+*.o
+*.obj
+
+# Precompiled Headers
+*.gch
+*.pch
+
+# Compiled Dynamic libraries
+*.so
+*.dylib
+*.dll
+
+# Fortran module files
+*.mod
+*.smod
+
+# Compiled Static libraries
+*.lai
+*.la
+*.a
+*.lib
+
+# Executables
+*.exe
+*.out
+*.app
+wadextract
+musdoom_player
+simple_test
+test_api
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+CTestTestfile.cmake
+cmake_install.cmake
+Makefile
+*.cmake
+!CMakeLists.txt
+!cmake/*.cmake
+!cmake/*.cmake.in
+CMakeScripts/
+CPackConfig.cmake
+CPackSourceConfig.cmake
+install_manifest.txt
+
+# IDE and editor files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+*.xcodeproj/
+*.xcworkspace/
+
+# Test output files
+*.wav
+output.wav
+
+# Game data files (ISOs, WADs, etc.)
+*.iso
+*.wad
+*.lmp
+
+# Package manager files
+node_modules/
+
+# Distribution / packaging
+*.tar.gz
+*.zip
+*.deb
+*.rpm

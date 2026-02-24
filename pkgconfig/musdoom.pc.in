@@ -1,0 +1,10 @@
+prefix=@CMAKE_INSTALL_PREFIX@
+exec_prefix=${prefix}
+libdir=${exec_prefix}/@CMAKE_INSTALL_LIBDIR@
+includedir=${prefix}/@CMAKE_INSTALL_INCLUDEDIR@
+
+Name: musdoom
+Description: Doom Music Playback Library - OPL2/OPL3 FM synthesis for MUS files
+Version: @PROJECT_VERSION@
+Libs: -L${libdir} -lmusdoom
+Cflags: -I${includedir}/musdoom
