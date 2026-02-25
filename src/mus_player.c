@@ -286,6 +286,7 @@ static void release_all_voices_for_channel(mus_player_t* player, channel_state_t
 static unsigned int frequency_for_voice(mus_player_t* player, voice_state_t* voice);
 static void set_channel_volume(mus_player_t* player, channel_state_t* channel, unsigned int volume, int clip_start);
 static void set_channel_pan(mus_player_t* player, channel_state_t* channel, unsigned int pan);
+static void reset_playback_state(mus_player_t* player);
 
 // Write OPL register
 static void write_opl_reg(mus_player_t* player, int reg, int value) {
@@ -921,21 +922,7 @@ void mus_player_start(mus_player_t* player, int looping) {
     
     player->looping = looping;
     player->playing = 1;
-    player->position = player->score;
-    player->current_sample = 0;
-    player->next_event_sample = 0;
-    player->timing_remainder = 0;
-    player->start_volume = player->master_volume;
-
-    // Reset voice lists on start
-    player->voice_free_num = player->num_voices;
-    player->voice_alloced_num = 0;
-    for (int i = 0; i < player->num_voices; i++) {
-        player->voice_free_list[i] = &player->voices[i];
-        player->voices[i].in_use = 0;
-        player->voices[i].current_instr = NULL;
-        player->voices[i].channel = NULL;
-    }
+    reset_playback_state(player);
 }
 
 // Stop playback
@@ -974,10 +961,7 @@ static void process_event(mus_player_t* player) {
     
     if (!player->position || player->position >= player->score + player->score_size) {
         if (player->looping) {
-            player->position = player->score;
-            player->current_sample = 0;
-            player->next_event_sample = 0;
-            player->timing_remainder = 0;
+            reset_playback_state(player);
         } else {
             player->playing = 0;
         }
@@ -1197,10 +1181,7 @@ static void process_event(mus_player_t* player) {
         }
         case MUS_EVENT_END_OF_SCORE:
             if (player->looping) {
-                player->position = player->score;
-            player->current_sample = 0;
-            player->next_event_sample = 0;
-            player->timing_remainder = 0;
+                reset_playback_state(player);
             } else {
                 player->playing = 0;
             }
@@ -1222,6 +1203,45 @@ static void advance_event_time(mus_player_t* player, uint32_t delay_ticks) {
                    + (uint64_t)delay_ticks * (uint64_t)player->sample_rate;
     player->next_event_sample += accum / 140;
     player->timing_remainder = accum % 140;
+}
+
+static void reset_playback_state(mus_player_t* player) {
+    int i;
+
+    player->position = player->score;
+    player->current_sample = 0;
+    player->next_event_sample = 0;
+    player->timing_remainder = 0;
+    player->start_volume = player->master_volume;
+
+    // Reset channels to default DMX-like state
+    for (i = 0; i < 16; i++) {
+        player->channels[i].instrument = 0;
+        player->channels[i].volume_base = 100;
+
+        if (player->master_volume > player->channels[i].volume_base) {
+            player->channels[i].volume = player->channels[i].volume_base;
+        } else {
+            player->channels[i].volume = player->master_volume;
+        }
+
+        player->channels[i].pan = 0x30;
+        player->channels[i].bend = 0;
+        player->channels[i].velocity = 127;
+    }
+
+    // Reset voice lists
+    player->voice_free_num = player->num_voices;
+    player->voice_alloced_num = 0;
+    for (i = 0; i < player->num_voices; i++) {
+        if (player->voices[i].in_use) {
+            voice_key_off(player, &player->voices[i]);
+        }
+        player->voice_free_list[i] = &player->voices[i];
+        player->voices[i].in_use = 0;
+        player->voices[i].current_instr = NULL;
+        player->voices[i].channel = NULL;
+    }
 }
 
 // Generate samples

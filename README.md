@@ -30,6 +30,15 @@ cmake ..
 make
 ```
 
+### Build musdoom_player (WAV generator)
+
+The `musdoom_player` example renders a MUS file to a WAV file.
+
+```bash
+cmake -S . -B build
+cmake --build build --target musdoom_player
+```
+
 ### Install
 
 ```bash
@@ -64,6 +73,29 @@ size_t samples = musdoom_generate_samples(emu, buffer, 2048);
 // Cleanup
 musdoom_destroy(emu);
 ```
+
+## musdoom_player Usage (WAV Generator)
+
+`musdoom_player` converts MUS files to WAV using the same synthesis engine as the library.
+
+```bash
+./build/examples/musdoom_player <input.mus> <genmidi.lmp> <output.wav> [duration_seconds]
+```
+
+Examples:
+
+```bash
+# Render 30 seconds of E1M1
+./build/examples/musdoom_player testdata/D_E1M1.lmp testdata/GENMIDI.lmp e1m1.wav 30
+
+# Render with looping (2 loops) and cap total output at 60 seconds
+./build/examples/musdoom_player -l 2 testdata/D_E1M1.lmp testdata/GENMIDI.lmp e1m1_loop.wav 60
+```
+
+Options:
+
+- `-l, --loop N` Loop N times using internal MUS looping
+- `-v, --volume N` Volume 0-127 (default: 100)
 
 ## Example: Integrating into an Audio Player
 
@@ -197,7 +229,7 @@ The GENMIDI file contains the OPL instrument definitions used by Doom. You can e
 ./wadextract doom.wad GENMIDI
 ```
 
-Or use the `GENMIDI.lmp` file included in the build directory.
+Or use the `GENMIDI.lmp` file included in the main directory.
 
 ## MUS File Format
 

@@ -244,28 +244,58 @@ int main(int argc, char* argv[]) {
     
     printf("Rendering audio (max %d seconds)...\n", max_duration_sec);
     
-    for (int loop = 0; loop < loop_count; loop++) {
+    if (loop_count <= 1) {
         musdoom_start(emu, 0);
-        
+
         while (musdoom_is_playing(emu) && total_samples < max_samples) {
             size_t samples_to_gen = 2048;
             if (total_samples + samples_to_gen > max_samples) {
                 samples_to_gen = max_samples - total_samples;
             }
-            
+
             size_t samples = musdoom_generate_samples(emu, buffer, samples_to_gen);
             if (samples > 0) {
                 fwrite(buffer, sizeof(int16_t), samples * 2, output);
                 total_samples += samples;
             }
-            
+
             // Progress indicator
             if (total_samples % (44100 * 5) == 0) {
                 printf("  %zu seconds rendered...\n", total_samples / 44100);
             }
         }
-        
-        printf("Loop %d/%d complete (%zu samples)\n", loop + 1, loop_count, total_samples);
+    } else {
+        // Use internal looping and stop after N loops (detect wraparound).
+        uint32_t last_pos_ms = 0;
+        int loops_done = 0;
+
+        musdoom_start(emu, 1);
+
+        while (musdoom_is_playing(emu) && loops_done < loop_count && total_samples < max_samples) {
+            size_t samples_to_gen = 2048;
+            if (total_samples + samples_to_gen > max_samples) {
+                samples_to_gen = max_samples - total_samples;
+            }
+
+            size_t samples = musdoom_generate_samples(emu, buffer, samples_to_gen);
+            if (samples > 0) {
+                fwrite(buffer, sizeof(int16_t), samples * 2, output);
+                total_samples += samples;
+            }
+
+            uint32_t pos_ms = musdoom_get_position_ms(emu);
+            if (pos_ms < last_pos_ms && last_pos_ms > 0) {
+                loops_done++;
+                printf("Loop %d/%d complete (%zu samples)\n",
+                       loops_done, loop_count, total_samples);
+            }
+            last_pos_ms = pos_ms;
+
+            // Progress indicator
+            if (total_samples % (44100 * 5) == 0) {
+                printf("  %zu seconds rendered...\n", total_samples / 44100);
+            }
+        }
     }
     
     // Update WAV header

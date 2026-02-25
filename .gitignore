@@ -70,7 +70,6 @@ output.wav
 # Game data files (ISOs, WADs, etc.)
 *.iso
 *.wad
-*.lmp
 
 # Package manager files
 node_modules/
