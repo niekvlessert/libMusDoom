@@ -1,0 +1,6 @@
+[submodule "chocolate-doom"]
+	path = chocolate-doom
+	url = https://github.com/chocolate-doom/chocolate-doom.git
+[submodule "doom-source"]
+	path = doom-source
+	url = https://github.com/id-Software/DOOM.git
