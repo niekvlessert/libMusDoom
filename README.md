@@ -4,6 +4,10 @@ A C library for playing Doom MUS music files using OPL3 FM synthesis, outputting
 
 This library faithfully reproduces the sound of the original Doom (1993) music by using the same OPL2/OPL3 FM synthesis engine that was used in the DOS version of the game.
 
+## You don't need the submodules when cloning it!
+
+They are included if you want to improve the library further.
+
 ## Features
 
 - Authentic Doom music playback using OPL3 FM synthesis
