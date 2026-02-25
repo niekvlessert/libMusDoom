@@ -869,6 +869,14 @@ int mus_player_load(mus_player_t* player, const uint8_t* data, size_t size) {
         header->id[2] != 'S' || header->id[3] != 0x1a) {
         return -1;
     }
+
+    // Validate score offset and length to avoid out-of-bounds access.
+    if ((size_t)header->score_start >= size) {
+        return -1;
+    }
+    if ((size_t)header->score_start + (size_t)header->score_len > size) {
+        return -1;
+    }
     
     player->data = data;
     player->data_size = size;
@@ -890,6 +898,15 @@ int mus_player_load_instruments(mus_player_t* player, const uint8_t* data, size_
     
     if (!player || !data || size < 8) {
         return -1;
+    }
+
+    // Ensure the data is large enough for the full GENMIDI payload.
+    {
+        const size_t instr_count = 128 + 47;
+        const size_t required_size = 8 + instr_count * sizeof(genmidi_instr_t);
+        if (size < required_size) {
+            return -1;
+        }
     }
     
     // Check GENMIDI signature
@@ -937,17 +954,25 @@ int mus_player_is_playing(mus_player_t* player) {
     return player->playing;
 }
 
-// Read variable-length quantity
-static uint32_t read_varlen(const uint8_t** ptr) {
+// Read variable-length quantity with bounds checking
+static int read_varlen_safe(const uint8_t** ptr, const uint8_t* end, uint32_t* out_value) {
     uint32_t value = 0;
     uint8_t byte;
-    
+
+    if (!ptr || !*ptr || !end || !out_value) {
+        return 0;
+    }
+
     do {
+        if (*ptr >= end) {
+            return 0;
+        }
         byte = *(*ptr)++;
         value = (value << 7) | (byte & 0x7f);
     } while (byte & 0x80);
-    
-    return value;
+
+    *out_value = value;
+    return 1;
 }
 
 // Process one MUS event
@@ -957,6 +982,7 @@ static void advance_event_time(mus_player_t* player, uint32_t delay_ticks);
 static void process_event(mus_player_t* player) {
     uint8_t event, channel, type;
     const uint8_t* ptr;
+    const uint8_t* end;
     uint32_t delay;
     
     if (!player->position || player->position >= player->score + player->score_size) {
@@ -969,6 +995,11 @@ static void process_event(mus_player_t* player) {
     }
     
     ptr = player->position;
+    end = player->score + player->score_size;
+    if (ptr >= end) {
+        player->playing = 0;
+        return;
+    }
     
     // Read event
     event = *ptr++;
@@ -981,6 +1012,10 @@ static void process_event(mus_player_t* player) {
     
     switch (type) {
         case MUS_EVENT_RELEASE_NOTE: {
+            if (ptr >= end) {
+                player->playing = 0;
+                return;
+            }
             uint8_t note = *ptr++;
             int i;
             for (i = 0; i < player->voice_alloced_num; i++) {
@@ -993,12 +1028,20 @@ static void process_event(mus_player_t* player) {
             break;
         }
         case MUS_EVENT_PLAY_NOTE: {
+            if (ptr >= end) {
+                player->playing = 0;
+                return;
+            }
             uint8_t note_data = *ptr++;
             uint8_t note = note_data & 0x7f;
             uint8_t velocity = (uint8_t)player->channels[channel].velocity;
             genmidi_instr_t* instr;
             
             if (note_data & 0x80) {
+                if (ptr >= end) {
+                    player->playing = 0;
+                    return;
+                }
                 velocity = *ptr++;
                 velocity &= 0x7f;
                 player->channels[channel].velocity = velocity;
@@ -1107,6 +1150,10 @@ static void process_event(mus_player_t* player) {
             break;
         }
         case MUS_EVENT_PITCH_BEND: {
+            if (ptr >= end) {
+                player->playing = 0;
+                return;
+            }
             uint8_t bend = *ptr++;
             // MUS pitch bend: 0-255, where 128 is center
             // Chocolate Doom uses: bend - 128 for the offset
@@ -1142,6 +1189,10 @@ static void process_event(mus_player_t* player) {
             break;
         }
         case MUS_EVENT_SYSTEM_EVENT: {
+            if (ptr >= end) {
+                player->playing = 0;
+                return;
+            }
             uint8_t sys_event = *ptr++;
             // Map MUS system events 10-14 to MIDI controllers.
             // 10: All sounds off (0x78), 11: All notes off (0x7B),
@@ -1162,6 +1213,10 @@ static void process_event(mus_player_t* player) {
             break;
         }
         case MUS_EVENT_CONTROLLER: {
+            if (ptr + 1 >= end) {
+                player->playing = 0;
+                return;
+            }
             uint8_t ctrl = *ptr++;
             uint8_t value = *ptr++;
             if (ctrl < 15) {
@@ -1190,7 +1245,10 @@ static void process_event(mus_player_t* player) {
     
     // Check for delay
     if (event & 0x80) {
-        delay = read_varlen(&ptr);
+        if (!read_varlen_safe(&ptr, end, &delay)) {
+            player->playing = 0;
+            return;
+        }
         advance_event_time(player, delay);
     }
     
@@ -1252,8 +1310,21 @@ size_t mus_player_generate(mus_player_t* player, int16_t* buffer, size_t num_sam
     
     while (samples_generated < num_samples) {
         // Process all events that are due at or before this sample
+        int event_guard = 0;
+        const int max_events_per_sample = 10000;
         while (player->playing && player->current_sample >= player->next_event_sample) {
+            const uint8_t* prev_pos = player->position;
             process_event(player);
+            event_guard++;
+            // If the event stream doesn't advance or loops too much, avoid a hang.
+            if (!player->playing) {
+                break;
+            }
+            if (player->position == prev_pos || event_guard > max_events_per_sample) {
+                // Force progress to the next sample to keep audio thread alive.
+                player->next_event_sample = player->current_sample + 1;
+                break;
+            }
         }
         
         // Generate one sample at the current time

@@ -15,6 +15,8 @@ set(MUSDOOM_SOURCES
     src/libmusdoom.c
     src/opl3.c
     src/mus_player.c
+    src/mus2mid.c
+    src/memio.c
 )
 
 set(MUSDOOM_HEADERS
@@ -22,6 +24,8 @@ set(MUSDOOM_HEADERS
     src/opl3.h
     src/doom_music.h
     src/internal/types.h
+    src/mus2mid.h
+    src/memio.h
 )
 
 # Create library

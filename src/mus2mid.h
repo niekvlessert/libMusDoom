@@ -23,7 +23,14 @@
 #include <stdbool.h>
 #include "memio.h"
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 bool mus2mid(MEMFILE *musinput, MEMFILE *midioutput);
 
-#endif /* #ifndef MUS2MID_H */
+#ifdef __cplusplus
+}
+#endif
 
+#endif /* #ifndef MUS2MID_H */
