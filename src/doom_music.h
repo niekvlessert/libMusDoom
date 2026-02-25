@@ -53,6 +53,13 @@ typedef struct {
     genmidi_voice_t voices[2]; // Two voices for double-voice instruments
 } genmidi_instr_t;
 
+// OPL driver version
+typedef enum {
+    opl_doom1_1_666,
+    opl_doom2_1_666,
+    opl_doom_1_9
+} opl_driver_ver_t;
+
 // MUS player forward declaration
 typedef struct mus_player_s mus_player_t;
 
@@ -66,13 +73,9 @@ void mus_player_stop(mus_player_t* player);
 int mus_player_is_playing(mus_player_t* player);
 size_t mus_player_generate(mus_player_t* player, int16_t* buffer, size_t num_samples);
 uint32_t mus_player_get_position_ms(mus_player_t* player);
-
-// OPL driver version
-typedef enum {
-    opl_doom1_1_666,
-    opl_doom2_1_666,
-    opl_doom_1_9
-} opl_driver_ver_t;
+void mus_player_set_master_volume(mus_player_t* player, int volume);
+void mus_player_set_driver_version(mus_player_t* player, opl_driver_ver_t version);
+void mus_player_set_opl3_mode(mus_player_t* player, int opl3_mode);
 
 // Channel data
 typedef struct {

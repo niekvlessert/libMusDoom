@@ -209,6 +209,7 @@ typedef struct {
     int voice;           // OPL voice assigned (-1 if none)
     int instrument;      // Current instrument (patch)
     int volume;          // Volume (0-127)
+    int volume_base;     // Base volume before master volume clip
     int pan;             // Pan (0-127, 64=center)
     int bend;            // Pitch bend value
     int active;          // Is note active?
@@ -233,6 +234,7 @@ typedef struct {
     unsigned int note_volume; // Note volume
     unsigned int reg_pan;     // Pan register value
     int in_use;          // Is this voice in use?
+    unsigned int priority;    // Voice priority
 } voice_state_t;
 
 // MUS player state
@@ -251,9 +253,18 @@ struct mus_player_s {
     int sample_rate;                  // Sample rate
     channel_state_t channels[16];     // MIDI channel states
     voice_state_t voices[18];         // OPL voice states
+    voice_state_t* voice_free_list[18];
+    voice_state_t* voice_alloced_list[18];
+    int voice_free_num;
+    int voice_alloced_num;
     genmidi_instr_t* instruments;     // Instrument definitions (main)
     genmidi_instr_t* percussion;      // Percussion instruments
     int instruments_loaded;           // Are instruments loaded?
+    int opl3_mode;                    // OPL3 enabled?
+    int num_voices;                   // 9 (OPL2) or 18 (OPL3)
+    opl_driver_ver_t driver_version;  // DMX behavior version
+    int master_volume;                // Current music volume (0-127)
+    int start_volume;                 // Start volume for clip behavior
 };
 
 // Forward declarations
@@ -263,14 +274,17 @@ static void set_voice_instrument(mus_player_t* player, voice_state_t* voice, gen
 static void set_voice_volume(mus_player_t* player, voice_state_t* voice, unsigned int volume);
 static void set_voice_pan(mus_player_t* player, voice_state_t* voice, unsigned int reg_pan);
 static void update_voice_frequency(mus_player_t* player, voice_state_t* voice);
-static void voice_key_on(mus_player_t* player, channel_state_t* channel, genmidi_instr_t* instrument, unsigned int note, unsigned int key, unsigned int volume);
+static void voice_key_on(mus_player_t* player, channel_state_t* channel, genmidi_instr_t* instrument, unsigned int instrument_voice, unsigned int note, unsigned int key, unsigned int volume);
 static void voice_key_off(mus_player_t* player, voice_state_t* voice);
-static voice_state_t* allocate_voice(mus_player_t* player);
-static void replace_voice(mus_player_t* player, channel_state_t* for_channel);
+static voice_state_t* get_free_voice(mus_player_t* player);
+static void release_voice_index(mus_player_t* player, int index);
+static void replace_existing_voice(mus_player_t* player);
+static void replace_existing_voice_doom1(mus_player_t* player);
+static void replace_existing_voice_doom2(mus_player_t* player, channel_state_t* for_channel);
 static void release_voice(mus_player_t* player, voice_state_t* voice);
 static void release_all_voices_for_channel(mus_player_t* player, channel_state_t* channel);
 static unsigned int frequency_for_voice(mus_player_t* player, voice_state_t* voice);
-static void set_channel_volume(mus_player_t* player, channel_state_t* channel, unsigned int volume);
+static void set_channel_volume(mus_player_t* player, channel_state_t* channel, unsigned int volume, int clip_start);
 static void set_channel_pan(mus_player_t* player, channel_state_t* channel, unsigned int pan);
 
 // Write OPL register
@@ -325,6 +339,10 @@ static void set_voice_instrument(mus_player_t* player, voice_state_t* voice, gen
     
     // Set feedback register
     write_opl_reg(player, (OPL_REGS_FEEDBACK + voice->index) | voice->array, data->feedback | voice->reg_pan);
+
+    // Calculate voice priority (matches Chocolate Doom)
+    voice->priority = 0x0f - (data->carrier.attack >> 4)
+                    + 0x0f - (data->carrier.sustain & 0x0f);
 }
 
 // Set voice volume (from Chocolate Doom)
@@ -389,11 +407,20 @@ static void set_voice_pan(mus_player_t* player, voice_state_t* voice, unsigned i
                   data->feedback | voice->reg_pan);
 }
 
-static void set_channel_volume(mus_player_t* player, channel_state_t* channel, unsigned int volume) {
+static void set_channel_volume(mus_player_t* player, channel_state_t* channel, unsigned int volume, int clip_start) {
     int i;
 
     if (volume > 127) {
         volume = 127;
+    }
+
+    channel->volume_base = (int)volume;
+
+    if (volume > (unsigned int)player->master_volume) {
+        volume = (unsigned int)player->master_volume;
+    }
+    if (clip_start && volume > (unsigned int)player->start_volume) {
+        volume = (unsigned int)player->start_volume;
     }
 
     channel->volume = (int)volume;
@@ -430,6 +457,111 @@ static void set_channel_pan(mus_player_t* player, channel_state_t* channel, unsi
             set_voice_pan(player, &player->voices[i], reg_pan);
         }
     }
+}
+
+static int channel_index_for_voice(mus_player_t* player, voice_state_t* voice) {
+    if (!voice || !voice->channel) {
+        return -1;
+    }
+    return (int)(voice->channel - player->channels);
+}
+
+// Get a free voice from the freelist
+static voice_state_t* get_free_voice(mus_player_t* player) {
+    int i;
+    voice_state_t* result;
+
+    if (player->voice_free_num == 0) {
+        return NULL;
+    }
+
+    result = player->voice_free_list[0];
+    player->voice_free_num--;
+
+    for (i = 0; i < player->voice_free_num; i++) {
+        player->voice_free_list[i] = player->voice_free_list[i + 1];
+    }
+
+    player->voice_alloced_list[player->voice_alloced_num++] = result;
+    result->in_use = 1;
+    return result;
+}
+
+static void release_voice_index(mus_player_t* player, int index) {
+    voice_state_t* voice;
+    int i;
+
+    if (index < 0 || index >= player->voice_alloced_num) {
+        return;
+    }
+
+    voice = player->voice_alloced_list[index];
+
+    voice_key_off(player, voice);
+    voice->channel = NULL;
+    voice->note = 0;
+    voice->current_instr = NULL;
+    voice->in_use = 0;
+
+    player->voice_alloced_num--;
+    for (i = index; i < player->voice_alloced_num; i++) {
+        player->voice_alloced_list[i] = player->voice_alloced_list[i + 1];
+    }
+
+    player->voice_free_list[player->voice_free_num++] = voice;
+}
+
+static void replace_existing_voice(mus_player_t* player) {
+    int i;
+    int result = 0;
+
+    for (i = 0; i < player->voice_alloced_num; i++) {
+        int chan_i = channel_index_for_voice(player, player->voice_alloced_list[i]);
+        int chan_r = channel_index_for_voice(player, player->voice_alloced_list[result]);
+
+        if (player->voice_alloced_list[i]->current_instr_voice != 0
+            || chan_i >= chan_r) {
+            result = i;
+        }
+    }
+
+    release_voice_index(player, result);
+}
+
+// Doom 1.666 behavior
+static void replace_existing_voice_doom1(mus_player_t* player) {
+    int i;
+    int result = 0;
+
+    for (i = 0; i < player->voice_alloced_num; i++) {
+        int chan_i = channel_index_for_voice(player, player->voice_alloced_list[i]);
+        int chan_r = channel_index_for_voice(player, player->voice_alloced_list[result]);
+
+        if (chan_i > chan_r) {
+            result = i;
+        }
+    }
+
+    release_voice_index(player, result);
+}
+
+// Doom 2 1.666 behavior
+static void replace_existing_voice_doom2(mus_player_t* player, channel_state_t* for_channel) {
+    int i;
+    int result = 0;
+    int priority = 0x8000;
+    int channel_idx = (int)(for_channel - player->channels);
+
+    for (i = 0; i < player->voice_alloced_num - 3; i++) {
+        int chan_i = channel_index_for_voice(player, player->voice_alloced_list[i]);
+        if (player->voice_alloced_list[i]->priority < (unsigned int)priority
+            && chan_i >= channel_idx) {
+            priority = (int)player->voice_alloced_list[i]->priority;
+            result = i;
+        }
+    }
+
+    release_voice_index(player, result);
 }
 // Calculate frequency for a voice (from Chocolate Doom)
 static unsigned int frequency_for_voice(mus_player_t* player, voice_state_t* voice) {
@@ -502,83 +634,36 @@ static void update_voice_frequency(mus_player_t* player, voice_state_t* voice) {
 // Turn on a voice (from Chocolate Doom)
 // Note: Chocolate Doom does NOT release the previous voice when a new note is played
 // The old voice continues until it receives a note off or is stolen
-static void voice_key_on(mus_player_t* player, channel_state_t* channel, genmidi_instr_t* instrument, unsigned int note, unsigned int key, unsigned int volume) {
+static void voice_key_on(mus_player_t* player, channel_state_t* channel, genmidi_instr_t* instrument, unsigned int instrument_voice, unsigned int note, unsigned int key, unsigned int volume) {
     voice_state_t* voice;
-    voice_state_t* voice2 = NULL;
-    int double_voice;
-    
-    // Check if this is a double-voice instrument
-    double_voice = (instrument->flags & GENMIDI_FLAG_2VOICE) != 0;
-    
-    // Allocate first voice - if none available, steal one
-    voice = allocate_voice(player);
+
+    // Allocate a voice; allocation policy handled by caller
+    voice = get_free_voice(player);
     if (!voice) {
-        replace_voice(player, channel);
-        voice = allocate_voice(player);
-        if (!voice) {
-            return;  // Still can't get a voice
-        }
+        return;
     }
-    
-    // For double-voice instruments, allocate a second voice
-    if (double_voice) {
-        voice2 = allocate_voice(player);
-        if (!voice2) {
-            replace_voice(player, channel);
-            voice2 = allocate_voice(player);
-            if (!voice2) {
-                // Can't get second voice, just use single
-                double_voice = 0;
-            }
-        }
-    }
-    
+
     voice->channel = channel;
     voice->key = key;
-    
+
     // Work out the note to use - normally same as key, unless fixed pitch
     if ((instrument->flags & GENMIDI_FLAG_FIXED) != 0) {
         voice->note = instrument->fixed_note;
     } else {
         voice->note = note;
     }
-    
+
     voice->reg_pan = channel->pan;
-    
-    // Set up the instrument (use first voice)
-    set_voice_instrument(player, voice, instrument, 0);
-    
+
+    // Program the voice for the requested instrument voice
+    set_voice_instrument(player, voice, instrument, instrument_voice);
+
     // Set volume
     set_voice_volume(player, voice, volume);
-    
+
     // Write frequency to turn the note on
     voice->freq = 0;
     update_voice_frequency(player, voice);
-    
-    // Set up second voice for double-voice instruments
-    if (double_voice && voice2) {
-        voice2->channel = channel;
-        voice2->key = key;
-        
-        // Same note calculation
-        if ((instrument->flags & GENMIDI_FLAG_FIXED) != 0) {
-            voice2->note = instrument->fixed_note;
-        } else {
-            voice2->note = note;
-        }
-        
-        voice2->reg_pan = channel->pan;
-        
-        // Set up the instrument (use second voice)
-        set_voice_instrument(player, voice2, instrument, 1);
-        
-        // Set volume
-        set_voice_volume(player, voice2, volume);
-        
-        // Write frequency to turn the note on
-        voice2->freq = 0;
-        update_voice_frequency(player, voice2);
-    }
 }
 
 // Turn off a voice (from Chocolate Doom)
@@ -588,94 +673,30 @@ static void voice_key_off(mus_player_t* player, voice_state_t* voice) {
 }
 
 // Replace an existing voice (voice stealing) - from Chocolate Doom
-static void replace_voice(mus_player_t* player, channel_state_t* for_channel) {
-    int i;
-    int result = 0;
-    int result_channel_idx = 0;
-    int voice_channel_idx;
-    
-    // Find the channel index of the voice we're considering
-    for (i = 0; i < 18; i++) {
-        if (player->voices[i].in_use) {
-            // Get channel index (0-15)
-            voice_channel_idx = player->voices[i].channel ? 
-                (int)(player->voices[i].channel - player->channels) : 0;
-            
-            // Second voice of double-voice instrument - best candidate
-            if (player->voices[i].current_instr_voice != 0) {
-                result = i;
-                break;
-            }
-            
-            // Get the channel index of the current result
-            result_channel_idx = player->voices[result].channel ?
-                (int)(player->voices[result].channel - player->channels) : 0;
-            
-            // Prefer voices on higher-numbered channels (lower priority)
-            // In Chocolate Doom: voice_alloced_list[i]->channel >= voice_alloced_list[result]->channel
-            if (voice_channel_idx >= result_channel_idx) {
-                result = i;
-            }
-        }
-    }
-    
-    // Release the selected voice
-    if (player->voices[result].in_use) {
-        voice_key_off(player, &player->voices[result]);
-        if (player->voices[result].channel) {
-            player->voices[result].channel->active = 0;
-            player->voices[result].channel->voice = -1;
-        }
-        player->voices[result].in_use = 0;
-        player->voices[result].channel = NULL;
-    }
-}
-
-// Allocate a free voice
-static voice_state_t* allocate_voice(mus_player_t* player) {
-    int i;
-    
-    for (i = 0; i < 18; i++) {
-        if (!player->voices[i].in_use) {
-            player->voices[i].in_use = 1;
-            return &player->voices[i];
-        }
-    }
-    
-    return NULL;  // No free voices
-}
-
 // Release a voice
 static void release_voice(mus_player_t* player, voice_state_t* voice) {
     if (!voice || !voice->in_use) return;
-    
-    voice_key_off(player, voice);
-    
-    if (voice->channel) {
-        voice->channel->active = 0;
-        voice->channel->voice = -1;
+    {
+        int i;
+        for (i = 0; i < player->voice_alloced_num; i++) {
+            if (player->voice_alloced_list[i] == voice) {
+                release_voice_index(player, i);
+                return;
+            }
+        }
     }
-    
-    voice->in_use = 0;
-    voice->channel = NULL;
-    voice->current_instr = NULL;
 }
 
 // Release all voices for a channel (for double-voice instruments)
 static void release_all_voices_for_channel(mus_player_t* player, channel_state_t* channel) {
     int i;
     
-    for (i = 0; i < 18; i++) {
-        if (player->voices[i].in_use && player->voices[i].channel == channel) {
-            voice_key_off(player, &player->voices[i]);
-            player->voices[i].in_use = 0;
-            player->voices[i].channel = NULL;
-            player->voices[i].current_instr = NULL;
+    for (i = 0; i < player->voice_alloced_num; i++) {
+        if (player->voice_alloced_list[i]->channel == channel) {
+            release_voice_index(player, i);
+            i--;
         }
     }
-    
-    channel->active = 0;
-    channel->voice = -1;
 }
 
 // Initialize OPL registers (from Chocolate Doom)
@@ -732,6 +753,11 @@ mus_player_t* mus_player_create(int sample_rate) {
     if (!player) return NULL;
     
     player->sample_rate = sample_rate;
+    player->opl3_mode = 1;
+    player->num_voices = 18;
+    player->driver_version = opl_doom_1_9;
+    player->master_volume = 100;
+    player->start_volume = 100;
     
     // Initialize OPL3
     OPL3_Reset(&player->opl, sample_rate);
@@ -744,6 +770,7 @@ mus_player_t* mus_player_create(int sample_rate) {
         player->channels[i].voice = -1;
         player->channels[i].instrument = 0;
         player->channels[i].volume = 100;
+        player->channels[i].volume_base = 100;
         player->channels[i].pan = 0x30;  // Center pan (both left and right)
         player->channels[i].bend = 0;
         player->channels[i].active = 0;
@@ -762,6 +789,13 @@ mus_player_t* mus_player_create(int sample_rate) {
         player->voices[i].channel = NULL;
         player->voices[i].reg_pan = 0x30;  // Center pan
         player->voices[i].freq = 0;
+    }
+
+    // Voice free/alloc lists
+    player->voice_free_num = player->num_voices;
+    player->voice_alloced_num = 0;
+    for (i = 0; i < player->num_voices; i++) {
+        player->voice_free_list[i] = &player->voices[i];
     }
     
     // Allocate instrument arrays
@@ -784,6 +818,39 @@ void mus_player_destroy(mus_player_t* player) {
     free(player->instruments);
     free(player->percussion);
     free(player);
+}
+
+void mus_player_set_master_volume(mus_player_t* player, int volume) {
+    int i;
+    if (!player) return;
+    if (volume < 0) volume = 0;
+    if (volume > 127) volume = 127;
+
+    if (player->master_volume == volume) {
+        return;
+    }
+
+    player->master_volume = volume;
+
+    for (i = 0; i < 16; ++i) {
+        if (i == 15) {
+            set_channel_volume(player, &player->channels[i], (unsigned int)volume, 0);
+        } else {
+            set_channel_volume(player, &player->channels[i],
+                               (unsigned int)player->channels[i].volume_base, 0);
+        }
+    }
+}
+
+void mus_player_set_driver_version(mus_player_t* player, opl_driver_ver_t version) {
+    if (!player) return;
+    player->driver_version = version;
+}
+
+void mus_player_set_opl3_mode(mus_player_t* player, int opl3_mode) {
+    if (!player) return;
+    player->opl3_mode = opl3_mode ? 1 : 0;
+    player->num_voices = player->opl3_mode ? 18 : 9;
 }
 
 // Load MUS data
@@ -858,6 +925,17 @@ void mus_player_start(mus_player_t* player, int looping) {
     player->current_sample = 0;
     player->next_event_sample = 0;
     player->timing_remainder = 0;
+    player->start_volume = player->master_volume;
+
+    // Reset voice lists on start
+    player->voice_free_num = player->num_voices;
+    player->voice_alloced_num = 0;
+    for (int i = 0; i < player->num_voices; i++) {
+        player->voice_free_list[i] = &player->voices[i];
+        player->voices[i].in_use = 0;
+        player->voices[i].current_instr = NULL;
+        player->voices[i].channel = NULL;
+    }
 }
 
 // Stop playback
@@ -920,19 +998,12 @@ static void process_event(mus_player_t* player) {
     switch (type) {
         case MUS_EVENT_RELEASE_NOTE: {
             uint8_t note = *ptr++;
-            // Chocolate Doom searches for voices by channel AND key
-            // This handles both melodic and percussion correctly
-            // For double-voice instruments, both voices will be released
             int i;
-            for (i = 0; i < 18; i++) {
-                if (player->voices[i].in_use && 
-                    player->voices[i].channel == &player->channels[channel] &&
-                    player->voices[i].key == note) {
-                    voice_key_off(player, &player->voices[i]);
-                    player->voices[i].in_use = 0;
-                    player->voices[i].channel = NULL;
-                    player->voices[i].current_instr = NULL;
-                    // Don't break - continue searching for double-voice instruments
+            for (i = 0; i < player->voice_alloced_num; i++) {
+                if (player->voice_alloced_list[i]->channel == &player->channels[channel] &&
+                    player->voice_alloced_list[i]->key == note) {
+                    release_voice_index(player, i);
+                    i--;
                 }
             }
             break;
@@ -953,14 +1024,11 @@ static void process_event(mus_player_t* player) {
             if (velocity <= 0) {
                 // Treat as note off - find voices by channel and key
                 int i;
-                for (i = 0; i < 18; i++) {
-                    if (player->voices[i].in_use && 
-                        player->voices[i].channel == &player->channels[channel] &&
-                        player->voices[i].key == note) {
-                        voice_key_off(player, &player->voices[i]);
-                        player->voices[i].in_use = 0;
-                        player->voices[i].channel = NULL;
-                        player->voices[i].current_instr = NULL;
+                for (i = 0; i < player->voice_alloced_num; i++) {
+                    if (player->voice_alloced_list[i]->channel == &player->channels[channel] &&
+                        player->voice_alloced_list[i]->key == note) {
+                        release_voice_index(player, i);
+                        i--;
                     }
                 }
                 break;
@@ -978,13 +1046,78 @@ static void process_event(mus_player_t* player) {
                 // Chocolate Doom uses note=60 for percussion, key=actual key
                 // The instrument's fixed_note will be used if GENMIDI_FLAG_FIXED is set
                 if (player->instruments_loaded) {
-                    voice_key_on(player, &player->channels[channel], instr, 60, note, velocity);
+                    // Voice allocation policy matches Chocolate Doom
+                    if (player->driver_version == opl_doom1_1_666) {
+                        int voicenum = (instr->flags & GENMIDI_FLAG_2VOICE) ? 2 : 1;
+                        if (!player->opl3_mode) {
+                            voicenum = 1;
+                        }
+                        while (player->voice_alloced_num > player->num_voices - voicenum) {
+                            replace_existing_voice_doom1(player);
+                        }
+                        if (instr->flags & GENMIDI_FLAG_2VOICE) {
+                            voice_key_on(player, &player->channels[channel], instr, 1, 60, note, velocity);
+                        }
+                        voice_key_on(player, &player->channels[channel], instr, 0, 60, note, velocity);
+                    } else if (player->driver_version == opl_doom2_1_666) {
+                        if (player->voice_alloced_num == player->num_voices) {
+                            replace_existing_voice_doom2(player, &player->channels[channel]);
+                        }
+                        if (player->voice_alloced_num == player->num_voices - 1 &&
+                            (instr->flags & GENMIDI_FLAG_2VOICE)) {
+                            replace_existing_voice_doom2(player, &player->channels[channel]);
+                        }
+                        if (instr->flags & GENMIDI_FLAG_2VOICE) {
+                            voice_key_on(player, &player->channels[channel], instr, 1, 60, note, velocity);
+                        }
+                        voice_key_on(player, &player->channels[channel], instr, 0, 60, note, velocity);
+                    } else {
+                        if (player->voice_free_num == 0) {
+                            replace_existing_voice(player);
+                        }
+                        voice_key_on(player, &player->channels[channel], instr, 0, 60, note, velocity);
+                        if (instr->flags & GENMIDI_FLAG_2VOICE) {
+                            voice_key_on(player, &player->channels[channel], instr, 1, 60, note, velocity);
+                        }
+                    }
                 }
             } else {
                 // Melodic instrument
                 instr = &player->instruments[player->channels[channel].instrument];
                 if (player->instruments_loaded) {
-                    voice_key_on(player, &player->channels[channel], instr, note, note, velocity);
+                    if (player->driver_version == opl_doom1_1_666) {
+                        int voicenum = (instr->flags & GENMIDI_FLAG_2VOICE) ? 2 : 1;
+                        if (!player->opl3_mode) {
+                            voicenum = 1;
+                        }
+                        while (player->voice_alloced_num > player->num_voices - voicenum) {
+                            replace_existing_voice_doom1(player);
+                        }
+                        if (instr->flags & GENMIDI_FLAG_2VOICE) {
+                            voice_key_on(player, &player->channels[channel], instr, 1, note, note, velocity);
+                        }
+                        voice_key_on(player, &player->channels[channel], instr, 0, note, note, velocity);
+                    } else if (player->driver_version == opl_doom2_1_666) {
+                        if (player->voice_alloced_num == player->num_voices) {
+                            replace_existing_voice_doom2(player, &player->channels[channel]);
+                        }
+                        if (player->voice_alloced_num == player->num_voices - 1 &&
+                            (instr->flags & GENMIDI_FLAG_2VOICE)) {
+                            replace_existing_voice_doom2(player, &player->channels[channel]);
+                        }
+                        if (instr->flags & GENMIDI_FLAG_2VOICE) {
+                            voice_key_on(player, &player->channels[channel], instr, 1, note, note, velocity);
+                        }
+                        voice_key_on(player, &player->channels[channel], instr, 0, note, note, velocity);
+                    } else {
+                        if (player->voice_free_num == 0) {
+                            replace_existing_voice(player);
+                        }
+                        voice_key_on(player, &player->channels[channel], instr, 0, note, note, velocity);
+                        if (instr->flags & GENMIDI_FLAG_2VOICE) {
+                            voice_key_on(player, &player->channels[channel], instr, 1, note, note, velocity);
+                        }
+                    }
                 }
             }
             break;
@@ -1000,12 +1133,26 @@ static void process_event(mus_player_t* player) {
             // Update all active voices on this channel
             {
                 int i;
-                for (i = 0; i < 18; i++) {
-                    if (player->voices[i].in_use && 
-                        player->voices[i].channel == &player->channels[channel]) {
-                        player->voices[i].freq = 0;  // Force frequency update
-                        update_voice_frequency(player, &player->voices[i]);
+                voice_state_t* updated[36];
+                int updated_num = 0;
+                voice_state_t* not_updated[36];
+                int not_updated_num = 0;
+
+                for (i = 0; i < player->voice_alloced_num; i++) {
+                    if (player->voice_alloced_list[i]->channel == &player->channels[channel]) {
+                        player->voice_alloced_list[i]->freq = 0;
+                        update_voice_frequency(player, player->voice_alloced_list[i]);
+                        updated[updated_num++] = player->voice_alloced_list[i];
+                    } else {
+                        not_updated[not_updated_num++] = player->voice_alloced_list[i];
                     }
+                }
+
+                for (i = 0; i < not_updated_num; i++) {
+                    player->voice_alloced_list[i] = not_updated[i];
+                }
+                for (i = 0; i < updated_num; i++) {
+                    player->voice_alloced_list[i + not_updated_num] = updated[i];
                 }
             }
             break;
@@ -1021,7 +1168,7 @@ static void process_event(mus_player_t* player) {
                     release_all_voices_for_channel(player, &player->channels[channel]);
                     break;
                 case 14: // Reset all controllers
-                    set_channel_volume(player, &player->channels[channel], 100);
+                    set_channel_volume(player, &player->channels[channel], 100, 0);
                     set_channel_pan(player, &player->channels[channel], 64);
                     player->channels[channel].bend = 0;
                     break;
@@ -1040,7 +1187,7 @@ static void process_event(mus_player_t* player) {
                     player->channels[channel].instrument = value;
                 } else if (midi_ctrl == 7) {
                     // Volume
-                    set_channel_volume(player, &player->channels[channel], value);
+                    set_channel_volume(player, &player->channels[channel], value, 1);
                 } else if (midi_ctrl == 10) {
                     // Pan
                     set_channel_pan(player, &player->channels[channel], value);

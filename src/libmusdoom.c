@@ -81,6 +81,10 @@ musdoom_emulator_t* musdoom_create(const musdoom_config_t* config) {
         free(emu);
         return NULL;
     }
+
+    mus_player_set_driver_version(emu->mus_player, emu->driver_version);
+    mus_player_set_opl3_mode(emu->mus_player, emu->opl3_mode);
+    mus_player_set_master_volume(emu->mus_player, emu->current_volume);
     
     return emu;
 }
@@ -186,6 +190,9 @@ void musdoom_set_volume(musdoom_emulator_t* emu, int volume) {
     if (volume < 0) volume = 0;
     if (volume > 127) volume = 127;
     emu->current_volume = volume;
+    if (emu->mus_player) {
+        mus_player_set_master_volume(emu->mus_player, volume);
+    }
 }
 
 // Get volume
